@@ -1,83 +1,85 @@
 import numpy as np
 import logging
 from collections import deque
-from functools import lru_cache
 from typing import Tuple, Dict, Any
-import warnings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-class ContextualThompsonSampler:
-    def __init__(self, min_bid: int = 80, max_bid: int = 100, tau: float = 2.0, history_window: int = 10):
+class ForkliftRouteOptimizer:
+    def __init__(self, route_min: int = 1, route_max: int = 10, tau: float = 2.0, memory: int = 10):
         """
-        Contextual Thompson Sampling with Softmax Scaling and Short-Term Memory
+        Contextual Thompson Sampling for Forklift Route Optimization in Warehouses
         
         Args:
-            min_bid: Minimum bid value
-            max_bid: Maximum bid value
-            tau: Temperature parameter for softmax scaling (higher = more exploration)
-            history_window: Maximum number of historical data points to maintain per context
+            route_min: Minimum route ID (e.g., shortest)
+            route_max: Maximum route ID (e.g., longest or most complex)
+            tau: Softmax temperature (higher = more exploration)
+            memory: Number of past interactions to remember per context
         """
-        self.validate_init_params(min_bid, max_bid, tau, history_window)
-        self.min_bid = min_bid
-        self.max_bid = max_bid
+        self.validate_init_params(route_min, route_max, tau, memory)
+        self.route_min = route_min
+        self.route_max = route_max
         self.tau = tau
-        self.history_window = history_window
-        self.history: Dict[Tuple[Any, Any], deque] = {}
-        self.beta_stats: Dict[Tuple[Any, Any], Dict[int, Tuple[int, int]]] = {}
-        
+        self.memory = memory
+
+        # Contextual memory of performance
+        self.route_history: Dict[Tuple[Any, Any], deque] = {}
+        self.beta_params: Dict[Tuple[Any, Any], Dict[int, Tuple[int, int]]] = {}
+
     @staticmethod
-    def validate_init_params(min_bid: int, max_bid: int, tau: float, history_window: int) -> None:
-        if min_bid >= max_bid:
-            raise ValueError(f"min_bid ({min_bid}) must be less than max_bid ({max_bid})")
+    def validate_init_params(route_min: int, route_max: int, tau: float, memory: int) -> None:
+        if route_min >= route_max:
+            raise ValueError("route_min must be less than route_max")
         if tau <= 0:
-            raise ValueError(f"tau ({tau}) must be positive")
-        if history_window < 1:
-            raise ValueError(f"history_window ({history_window}) must be at least 1")
+            raise ValueError("tau must be positive")
+        if memory < 1:
+            raise ValueError("memory must be at least 1")
 
-    def stable_softmax(self, values: np.ndarray) -> np.ndarray:
-        values = values / self.tau
-        values = values - np.max(values)
-        exp_values = np.exp(values)
-        return exp_values / np.sum(exp_values)
+    def softmax(self, values: np.ndarray) -> np.ndarray:
+        scaled = values / self.tau
+        scaled -= np.max(scaled)
+        probs = np.exp(scaled)
+        return probs / np.sum(probs)
 
-    def sample_bid(self, campaign_id: Any, revenue_bucket: Any) -> int:
-        key = (campaign_id, revenue_bucket)
+    def select_route(self, zone_id: Any, task_type: Any) -> int:
+        """
+        Select a route using contextual Thompson Sampling and softmax exploration.
+        """
+        context = (zone_id, task_type)
 
-        if key not in self.history:
-            self.history[key] = deque(maxlen=self.history_window)
-            self.beta_stats[key] = {bid: [1, 1] for bid in range(self.min_bid, self.max_bid + 1)}
-        
-        bid_samples = {bid: np.random.beta(a, b) for bid, (a, b) in self.beta_stats[key].items()}
-        bid_values = np.array(list(bid_samples.values()))
-        bid_keys = np.array(list(bid_samples.keys()))
-        bid_probs = self.stable_softmax(bid_values)
-        chosen_bid = np.random.choice(bid_keys, p=bid_probs)
-        
-        return int(chosen_bid)
+        if context not in self.route_history:
+            self.route_history[context] = deque(maxlen=self.memory)
+            self.beta_params[context] = {route: [1, 1] for route in range(self.route_min, self.route_max + 1)}
 
-    def update(self, campaign_id: Any, revenue_bucket: Any, bid: int, win: int) -> None:
-        key = (campaign_id, revenue_bucket)
-        
-        if key not in self.history:
-            self.history[key] = deque(maxlen=self.history_window)
-            self.beta_stats[key] = {bid: [1, 1] for bid in range(self.min_bid, self.max_bid + 1)}
-        
-        self.history[key].append((bid, win))
-        self._recompute_beta_from_deque(key)
-        
-    def _recompute_beta_from_deque(self, key: Tuple[Any, Any]) -> None:
-        bid_counts = {bid: [1, 1] for bid in range(self.min_bid, self.max_bid + 1)}
-        
-        for bid, win in self.history[key]:
-            bid_counts[bid][0] += win  # Increment wins (alpha)
-            bid_counts[bid][1] += 1 - win  # Increment losses (beta)
-        
-        self.beta_stats[key] = bid_counts
+        samples = {route: np.random.beta(a, b) for route, (a, b) in self.beta_params[context].items()}
+        values = np.array(list(samples.values()))
+        keys = np.array(list(samples.keys()))
+        probs = self.softmax(values)
 
-    def get_bid_distribution(self, campaign_id: Any, revenue_bucket: Any) -> Dict[int, list]:
-        key = (campaign_id, revenue_bucket)
-        if key not in self.history or len(self.history[key]) == 0:
-            return {}
-        
-        return self.beta_stats[key]
+        return int(np.random.choice(keys, p=probs))
+
+    def update(self, zone_id: Any, task_type: Any, route: int, success: int) -> None:
+        """
+        Update route feedback based on success (1) or failure/delay (0).
+        """
+        context = (zone_id, task_type)
+
+        if context not in self.route_history:
+            self.route_history[context] = deque(maxlen=self.memory)
+            self.beta_params[context] = {r: [1, 1] for r in range(self.route_min, self.route_max + 1)}
+
+        self.route_history[context].append((route, success))
+        self._recompute_betas(context)
+
+    def _recompute_betas(self, context: Tuple[Any, Any]) -> None:
+        counts = {r: [1, 1] for r in range(self.route_min, self.route_max + 1)}
+
+        for route, success in self.route_history[context]:
+            counts[route][0] += success      # alpha (wins)
+            counts[route][1] += 1 - success  # beta (failures)
+
+        self.beta_params[context] = counts
+
+    def get_route_stats(self, zone_id: Any, task_type: Any) -> Dict[int, list]:
+        context = (zone_id, task_type)
+        return self.beta_params.get(context, {})
